@@ -1,0 +1,125 @@
+#version 450
+
+// ============================================================
+// gru_forward.comp — GRU cell forward pass (single timestep)
+// ============================================================
+// One workgroup per batch element. One invocation per hidden unit.
+//
+// GRU equations:
+//   z = sigmoid(W_z @ x + U_z @ h_prev + b_z)
+//   r = sigmoid(W_r @ x + U_r @ h_prev + b_r)
+//   h_hat = tanh(W_h @ x + U_h @ (r ⊙ h_prev) + b_h)
+//   h_new = (1 - z) * h_prev + z * h_hat
+//
+// Two-pass approach using shared memory:
+//   Pass 1: compute z[j] and r[j] for all j, store r*h in shared
+//   Barrier
+//   Pass 2: compute h_hat[j] using shared r*h, then h_new[j]
+//
+// Weight layout:
+//   W: [3, input_size, hidden_size]  — row-major, gate × input × hidden
+//   U: [3, hidden_size, hidden_size] — row-major, gate × hidden × hidden
+//   bias: [6, hidden_size]           — [bW_z, bW_r, bW_h, bU_z, bU_r, bU_h]
+//                                      (split input/hidden biases for PyTorch compat)
+//
+// Activation cache (for BPTT):
+//   Per timestep: [B, 4*H] = [z, r, h_hat, h_prev] flattened
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuf   { float x_data[]; };
+layout(std430, binding = 1)           buffer HiddenBuf  { float h_data[]; };
+layout(std430, binding = 2) readonly  buffer WBuf       { float W[]; };
+layout(std430, binding = 3) readonly  buffer UBuf       { float U[]; };
+layout(std430, binding = 4) readonly  buffer BiasBuf    { float bias[]; };
+layout(std430, binding = 5) writeonly buffer OutputBuf  { float out_data[]; };
+layout(std430, binding = 6) writeonly buffer CacheBuf   { float cache[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    int cache_offset;  // element offset into cache for this timestep
+};
+
+shared float s_rh[64];  // r[k] * h_prev[k] for all k in workgroup
+
+void main() {
+    int j = int(gl_LocalInvocationID.x);
+    int b = int(gl_WorkGroupID.x);
+
+    if (b >= batch_size) return;
+    // All threads must hit barrier — inis_active threads participate but don't write
+    bool is_active = (j < hidden_size);
+
+    int H = hidden_size;
+    int I = input_size;
+
+    int x_base = b * I;
+    int h_base = b * H;
+    int w_gate_stride = I * H;
+    int u_gate_stride = H * H;
+
+    float h_prev = 0.0;
+    float wx_z = 0.0, wx_r = 0.0, wx_h = 0.0;
+    float uh_z = 0.0, uh_r = 0.0;
+    float z = 0.0, r = 0.0;
+
+    float uh_n = 0.0;  // U_n @ h_prev (for candidate, before r multiply)
+
+    if (is_active) {
+        // --- Load h_prev ---
+        h_prev = h_data[h_base + j];
+
+        // --- W @ x for all gates ---
+        for (int i = 0; i < I; i++) {
+            float xi = x_data[x_base + i];
+            wx_z += xi * W[0 * w_gate_stride + i * H + j];
+            wx_r += xi * W[1 * w_gate_stride + i * H + j];
+            wx_h += xi * W[2 * w_gate_stride + i * H + j];
+        }
+
+        // --- U @ h_prev for ALL gates (z, r, n) ---
+        for (int k = 0; k < H; k++) {
+            float hk = h_data[h_base + k];
+            uh_z += hk * U[0 * u_gate_stride + k * H + j];
+            uh_r += hk * U[1 * u_gate_stride + k * H + j];
+            uh_n += hk * U[2 * u_gate_stride + k * H + j];
+        }
+
+        // bias layout: [bW_z | bW_r | bW_n | bU_z | bU_r | bU_n], each H floats
+        float bz = bias[0 * H + j] + bias[3 * H + j];
+        float br = bias[1 * H + j] + bias[4 * H + j];
+
+        z = 1.0 / (1.0 + exp(-(wx_z + uh_z + bz)));
+        r = 1.0 / (1.0 + exp(-(wx_r + uh_r + br)));
+
+        // PyTorch GRU candidate: n = tanh(W_n @ x + b_Wn + r * (U_n @ h + b_Un))
+        float b_wn = bias[2 * H + j];
+        float b_un = bias[5 * H + j];
+        float h_hat_val = tanh(wx_h + b_wn + r * (uh_n + b_un));
+
+        // PyTorch GRU output: h = (1-z) * n + z * h_prev
+        float h_new = (1.0 - z) * h_hat_val + z * h_prev;
+
+        // Write outputs
+        h_data[h_base + j] = h_new;
+        out_data[h_base + j] = h_new;
+
+        // Cache activations for BPTT
+        int c_base = cache_offset + b * 4 * H;
+        cache[c_base + 0 * H + j] = z;
+        cache[c_base + 1 * H + j] = r;
+        cache[c_base + 2 * H + j] = h_hat_val;
+        cache[c_base + 3 * H + j] = h_prev;
+
+        // Dummy shared write so barrier below is valid
+        s_rh[j] = 0.0;
+    } else {
+        s_rh[j] = 0.0;
+    }
+
+    // Barrier no longer needed (r applied per-unit, no cross-thread dependency)
+    // Keep for future use if we switch to pre-reset formulation
+}

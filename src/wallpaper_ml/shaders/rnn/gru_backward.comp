@@ -1,0 +1,239 @@
+#version 450
+
+// ============================================================
+// gru_backward.comp — GRU cell backward pass (single timestep)
+// ============================================================
+// One workgroup per batch element. One invocation per hidden unit.
+//
+// PyTorch GRU forward:
+//   z = sigmoid(W_z@x + b_Wz + U_z@h_prev + b_Uz)
+//   r = sigmoid(W_r@x + b_Wr + U_r@h_prev + b_Ur)
+//   n = tanh(W_n@x + b_Wn + r * (U_n@h_prev + b_Un))
+//   h = (1-z)*n + z*h_prev
+//
+// Inputs: dL/dh, cached [z, r, n, h_prev], input x, weights
+// Outputs: dL/dh_prev (written to dh buffer), dL/dx
+// Accumulates: dL/dW, dL/dU, dL/dbias via CAS atomics
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuf     { float x_data[]; };
+layout(std430, binding = 1)           buffer GradHBuf     { float dh[]; };
+layout(std430, binding = 2) writeonly buffer GradXBuf     { float dx[]; };
+layout(std430, binding = 3) readonly  buffer CacheBuf     { float cache[]; };
+layout(std430, binding = 4) readonly  buffer WBuf         { float W[]; };
+layout(std430, binding = 5) readonly  buffer UBuf         { float U_data[]; };
+layout(std430, binding = 6) readonly  buffer BiasBuf      { float bias[]; };
+layout(std430, binding = 7)           buffer GradWBuf     { uint grad_W[]; };
+layout(std430, binding = 8)           buffer GradUBuf     { uint grad_U[]; };
+layout(std430, binding = 9)           buffer GradBiasBuf  { uint grad_bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    int cache_offset;     // float-element offset into cache for this timestep
+    int input_offset;     // float-element offset into x_data (seq-mode: t*B*I, single-step: 0)
+    int grad_x_offset;    // float-element offset into dx (seq-mode: t*B*I, single-step: 0)
+};
+
+shared float s_dz_pre[64];
+shared float s_dr_pre[64];
+shared float s_dn_pre[64];
+shared float s_d_ruh[64];
+
+void main() {
+    int j = int(gl_LocalInvocationID.x);
+    int b = int(gl_WorkGroupID.x);
+
+    if (b >= batch_size) return;
+    bool is_active = (j < hidden_size);
+
+    int H = hidden_size;
+    int I = input_size;
+    int h_base = b * H;
+    int x_base = input_offset + b * I;
+    int dx_base = grad_x_offset + b * I;
+    int w_gate_stride = I * H;
+    int u_gate_stride = H * H;
+
+    float dz_pre_val = 0.0, dr_pre_val = 0.0, dn_pre_val = 0.0, d_ruh_val = 0.0;
+    float dh_prev_direct = 0.0;
+
+    if (is_active) {
+        // Load cached activations
+        int c_base = cache_offset + b * 4 * H;
+        float z_val = cache[c_base + 0 * H + j];
+        float r_val = cache[c_base + 1 * H + j];
+        float n_val = cache[c_base + 2 * H + j];
+        float h_prev = cache[c_base + 3 * H + j];
+
+        float dh_j = dh[h_base + j];
+
+        // From h = (1-z)*n + z*h_prev:
+        float dn_val = dh_j * (1.0 - z_val);
+        float dz_val = dh_j * (h_prev - n_val);
+        dh_prev_direct = dh_j * z_val;
+
+        // tanh derivative: dn_pre = dn * (1 - n^2)
+        dn_pre_val = dn_val * (1.0 - n_val * n_val);
+
+        // sigmoid derivative for z
+        dz_pre_val = dz_val * z_val * (1.0 - z_val);
+
+        // For reset gate: need (U_n @ h_prev + b_Un)[j]
+        float uh_n_plus_b = bias[5 * H + j];
+        for (int k = 0; k < H; k++) {
+            float hk = cache[c_base + 3 * H + k];
+            uh_n_plus_b += hk * U_data[2 * u_gate_stride + k * H + j];
+        }
+        float dr_from_n = dn_pre_val * uh_n_plus_b;
+        dr_pre_val = dr_from_n * r_val * (1.0 - r_val);
+
+        // Gradient into U_n path: d_ruh = dn_pre * r
+        d_ruh_val = dn_pre_val * r_val;
+
+        // Store for Phase 2
+        s_dz_pre[j] = dz_pre_val;
+        s_dr_pre[j] = dr_pre_val;
+        s_dn_pre[j] = dn_pre_val;
+        s_d_ruh[j] = d_ruh_val;
+
+        // --- Accumulate W gradients ---
+        for (int i = 0; i < I; i++) {
+            float xi = x_data[x_base + i];
+            if (dz_pre_val != 0.0) {
+                uint tgt = uint(0 * w_gate_stride + i * H + j);
+                uint exp_val = grad_W[tgt];
+                while (true) {
+                    uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dz_pre_val * xi);
+                    uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
+                    if (old == exp_val) break;
+                    exp_val = old;
+                }
+            }
+            if (dr_pre_val != 0.0) {
+                uint tgt = uint(1 * w_gate_stride + i * H + j);
+                uint exp_val = grad_W[tgt];
+                while (true) {
+                    uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dr_pre_val * xi);
+                    uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
+                    if (old == exp_val) break;
+                    exp_val = old;
+                }
+            }
+            if (dn_pre_val != 0.0) {
+                uint tgt = uint(2 * w_gate_stride + i * H + j);
+                uint exp_val = grad_W[tgt];
+                while (true) {
+                    uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dn_pre_val * xi);
+                    uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
+                    if (old == exp_val) break;
+                    exp_val = old;
+                }
+            }
+        }
+
+        // --- Accumulate U gradients ---
+        for (int k = 0; k < H; k++) {
+            float hk = cache[c_base + 3 * H + k];
+            if (dz_pre_val != 0.0) {
+                uint tgt = uint(0 * u_gate_stride + k * H + j);
+                uint exp_val = grad_U[tgt];
+                while (true) {
+                    uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dz_pre_val * hk);
+                    uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
+                    if (old == exp_val) break;
+                    exp_val = old;
+                }
+            }
+            if (dr_pre_val != 0.0) {
+                uint tgt = uint(1 * u_gate_stride + k * H + j);
+                uint exp_val = grad_U[tgt];
+                while (true) {
+                    uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dr_pre_val * hk);
+                    uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
+                    if (old == exp_val) break;
+                    exp_val = old;
+                }
+            }
+            if (d_ruh_val != 0.0) {
+                uint tgt = uint(2 * u_gate_stride + k * H + j);
+                uint exp_val = grad_U[tgt];
+                while (true) {
+                    uint des = floatBitsToUint(uintBitsToFloat(exp_val) + d_ruh_val * hk);
+                    uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
+                    if (old == exp_val) break;
+                    exp_val = old;
+                }
+            }
+        }
+
+        // --- Accumulate bias gradients ---
+        // [bW_z, bW_r, bW_n, bU_z, bU_r, bU_n]
+        uint bj = uint(j);
+        // bW_z: same grad as W_z gate
+        { uint tgt = 0u * uint(H) + bj; uint e = grad_bias[tgt];
+          while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dz_pre_val);
+          uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+        // bW_r: same grad as W_r gate
+        { uint tgt = 1u * uint(H) + bj; uint e = grad_bias[tgt];
+          while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dr_pre_val);
+          uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+        // bW_n: grad from candidate (dn_pre, before r multiply)
+        { uint tgt = 2u * uint(H) + bj; uint e = grad_bias[tgt];
+          while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dn_pre_val);
+          uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+        // bU_z: same as bW_z
+        { uint tgt = 3u * uint(H) + bj; uint e = grad_bias[tgt];
+          while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dz_pre_val);
+          uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+        // bU_r: same as bW_r
+        { uint tgt = 4u * uint(H) + bj; uint e = grad_bias[tgt];
+          while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dr_pre_val);
+          uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+        // bU_n: grad through r gate (d_ruh = dn_pre * r)
+        { uint tgt = 5u * uint(H) + bj; uint e = grad_bias[tgt];
+          while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+d_ruh_val);
+          uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+
+        // Write direct dh_prev contribution
+        dh[h_base + j] = dh_prev_direct;
+    } else {
+        s_dz_pre[j] = 0.0;
+        s_dr_pre[j] = 0.0;
+        s_dn_pre[j] = 0.0;
+        s_d_ruh[j] = 0.0;
+    }
+
+    barrier();
+
+    // --- Phase 2: dh_prev += U^T @ gate_grads ---
+    if (is_active) {
+        float dh_prev_recurrent = 0.0;
+        for (int k = 0; k < H; k++) {
+            // U layout: U[gate][row][col] = U_data[gate*H*H + row*H + col]
+            // Transposed: sum over k (columns), for row j
+            dh_prev_recurrent += s_dz_pre[k] * U_data[0 * u_gate_stride + j * H + k];
+            dh_prev_recurrent += s_dr_pre[k] * U_data[1 * u_gate_stride + j * H + k];
+            dh_prev_recurrent += s_d_ruh[k] * U_data[2 * u_gate_stride + j * H + k];
+        }
+        dh[h_base + j] += dh_prev_recurrent;
+    }
+
+    barrier();
+
+    // --- Phase 3: dx[i] = W^T @ gate_grads ---
+    if (j < I) {
+        float dx_val = 0.0;
+        for (int k = 0; k < H; k++) {
+            // W layout: W[gate][i][j] = W[gate*I*H + i*H + j]
+            // Transposed: for input i, sum over hidden k
+            dx_val += s_dz_pre[k] * W[0 * w_gate_stride + j * H + k];
+            dx_val += s_dr_pre[k] * W[1 * w_gate_stride + j * H + k];
+            dx_val += s_dn_pre[k] * W[2 * w_gate_stride + j * H + k];
+        }
+        dx[dx_base + j] = dx_val;
+    }
+}

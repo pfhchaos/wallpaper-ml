@@ -1,0 +1,85 @@
+#version 450
+
+// ============================================================
+// linear_backward.comp — Dense linear layer backward pass
+// ============================================================
+// Given dL/dy, computes dx, accumulates dW and db via CAS atomics.
+//
+// One invocation per (batch, input_unit).
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer GradOutBuf  { float dy[]; };
+layout(std430, binding = 1) readonly  buffer InputBuf    { float x_data[]; };
+layout(std430, binding = 2) readonly  buffer WeightBuf   { float W[]; };
+layout(std430, binding = 3) writeonly buffer GradInBuf   { float dx[]; };
+layout(std430, binding = 4)           buffer GradWBuf    { uint grad_W[]; };
+layout(std430, binding = 5)           buffer GradBBuf    { uint grad_bias[]; };
+layout(std430, binding = 6) readonly  buffer FwdOutBuf   { float fwd_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int in_features;
+    int out_features;
+    int relu;
+};
+
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int total = batch_size * in_features;
+    if (idx >= total) return;
+
+    int b = idx / in_features;
+    int i = idx % in_features;
+
+    int I = in_features;
+    int O = out_features;
+
+    // --- Compute dx[b,i] = sum_j(masked_dy[b,j] * W[i,j]) ---
+    float dx_val = 0.0;
+    for (int j = 0; j < O; j++) {
+        float dy_j = dy[b * O + j];
+        if (relu == 1 && fwd_out[b * O + j] <= 0.0) dy_j = 0.0;
+        dx_val += dy_j * W[i * O + j];
+    }
+    dx[b * I + i] = dx_val;
+
+    // --- Accumulate weight gradients via CAS ---
+    float xi = x_data[b * I + i];
+    for (int j = 0; j < O; j++) {
+        float dy_j = dy[b * O + j];
+        if (relu == 1 && fwd_out[b * O + j] <= 0.0) dy_j = 0.0;
+        float val = xi * dy_j;
+        if (val != 0.0) {
+            uint target = uint(i * O + j);
+            uint expected = grad_W[target];
+            uint desired;
+            while (true) {
+                desired = floatBitsToUint(uintBitsToFloat(expected) + val);
+                uint old = atomicCompSwap(grad_W[target], expected, desired);
+                if (old == expected) break;
+                expected = old;
+            }
+        }
+    }
+
+    // --- Accumulate bias gradients (only i==0 to avoid redundant work) ---
+    if (i == 0) {
+        for (int j = 0; j < O; j++) {
+            float dy_j = dy[b * O + j];
+            if (relu == 1 && fwd_out[b * O + j] <= 0.0) dy_j = 0.0;
+            if (dy_j != 0.0) {
+                uint target = uint(j);
+                uint expected = grad_bias[target];
+                uint desired;
+                while (true) {
+                    desired = floatBitsToUint(uintBitsToFloat(expected) + dy_j);
+                    uint old = atomicCompSwap(grad_bias[target], expected, desired);
+                    if (old == expected) break;
+                    expected = old;
+                }
+            }
+        }
+    }
+}

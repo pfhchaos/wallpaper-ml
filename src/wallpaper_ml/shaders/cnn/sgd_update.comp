@@ -1,0 +1,30 @@
+#version 450
+
+// ============================================================
+// sgd_update.comp — SGD weight update + zero gradients
+// ============================================================
+// w -= lr * grad
+// grad = 0
+//
+// Gradients stored as uint (from CAS atomics), interpreted as float.
+// One thread per weight.
+// ============================================================
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer WeightBuf { float weights[]; };
+layout(std430, binding = 1) buffer GradBuf   { uint grads_u[];  };  // float stored as uint
+
+layout(push_constant) uniform PushConstants {
+    float lr;
+    uint count;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= count) return;
+
+    float grad = uintBitsToFloat(grads_u[idx]);
+    weights[idx] -= lr * grad;
+    grads_u[idx] = 0u;  // zero gradient for next iteration
+}

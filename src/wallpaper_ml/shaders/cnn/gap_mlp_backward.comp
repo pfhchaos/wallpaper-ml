@@ -1,0 +1,118 @@
+#version 450
+
+// ============================================================
+// gap_mlp_backward.comp — Backward through MLP + GAP
+// ============================================================
+// Given upstream gradient dL/d_output[B]:
+//
+// Linear2 backward (scalar → hidden):
+//   d_relu_hidden[b,h] = d_output[b] * W2[h]
+//   d_hidden[b,h] = d_relu_hidden[b,h] * (pre_relu_hidden[b,h] > 0 ? 1 : 0)
+//   d_W2[h] += sum_b(d_output[b] * relu(pre_relu_hidden[b,h]))
+//   d_b2 += sum_b(d_output[b])
+//
+// Linear1 backward (hidden → pooled):
+//   d_pooled[b,c] = sum_h(d_hidden[b,h] * W1[c,h])
+//   d_W1[c,h] += sum_b(d_hidden[b,h] * pooled[b,c])
+//   d_b1[h] += sum_b(d_hidden[b,h])
+//
+// GAP backward (pooled → input):
+//   d_input[b,c,y,x] = d_pooled[b,c] / (H * W)
+//
+// One thread per (batch, channel, spatial_y, spatial_x).
+// Weight gradients via CAS atomicAdd.
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly  buffer UpstreamGrad { float d_output[];  };  // [B]
+layout(std430, binding = 1) readonly  buffer PooledBuf    { float pooled[];    };  // [B, C]
+layout(std430, binding = 2) readonly  buffer WeightBuf    { float weights[];   };  // [W1,b1,W2,b2]
+layout(std430, binding = 3) writeonly buffer GradInputBuf { float d_input[];   };  // [B, C, H, W]
+layout(std430, binding = 4) buffer          GradWeightBuf { uint d_weights_u[];};  // same size as weights, uint for CAS
+layout(std430, binding = 5) readonly  buffer HiddenBuf    { float hidden[];    };  // [B, hidden_dim] pre-ReLU
+// Note: binding 5 here (backward has 6 buffers: 0-5). Forward uses binding 4.
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int channels;
+    int height;
+    int width;
+    int hidden_dim;
+};
+
+// CAS-emulated float atomicAdd
+void atomicAddFloat(uint idx, float val) {
+    uint old_val, new_val, assumed;
+    old_val = d_weights_u[idx];
+    do {
+        assumed = old_val;
+        new_val = floatBitsToUint(uintBitsToFloat(assumed) + val);
+        old_val = atomicCompSwap(d_weights_u[idx], assumed, new_val);
+    } while (old_val != assumed);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    int bc = int(gl_GlobalInvocationID.z);
+    int b = bc / channels;
+    int c = bc % channels;
+
+    if (x >= width || y >= height || b >= batch_size) return;
+
+    int C = channels;
+    int H = hidden_dim;
+    float inv_spatial = 1.0 / float(height * width);
+
+    // Weight layout offsets
+    int w1_off = 0;
+    int b1_off = C * H;
+    int w2_off = C * H + H;
+    int b2_off = C * H + H + H;
+
+    float d_out = d_output[b];
+
+    // Compute d_pooled[b, c] = sum_h(d_hidden[b,h] * W1[c,h])
+    // where d_hidden[b,h] = d_output[b] * W2[h] * relu_mask[b,h]
+    float d_pooled = 0.0;
+    for (int h = 0; h < H; h++) {
+        float pre_relu = hidden[b * H + h];
+        float relu_mask = (pre_relu > 0.0) ? 1.0 : 0.0;
+        float d_hidden_h = d_out * weights[w2_off + h] * relu_mask;
+        d_pooled += d_hidden_h * weights[w1_off + c * H + h];
+    }
+
+    // GAP backward: d_input = d_pooled / (H * W)
+    float d_inp = d_pooled * inv_spatial;
+    int idx = ((b * C + c) * height + y) * width + x;
+    d_input[idx] = d_inp;
+
+    // Weight gradients — one thread per (b,c) contributes
+    if (x == 0 && y == 0) {
+        float pooled_bc = pooled[b * C + c];
+
+        for (int h = 0; h < H; h++) {
+            float pre_relu = hidden[b * H + h];
+            float relu_mask = (pre_relu > 0.0) ? 1.0 : 0.0;
+            float d_hidden_h = d_out * weights[w2_off + h] * relu_mask;
+
+            // d_W1[c, h] += d_hidden[b,h] * pooled[b,c]
+            atomicAddFloat(uint(w1_off + c * H + h), d_hidden_h * pooled_bc);
+
+            // d_b1[h] += d_hidden[b,h]  (only once per b, use c==0)
+            if (c == 0) {
+                atomicAddFloat(uint(b1_off + h), d_hidden_h);
+
+                // d_W2[h] += d_output[b] * relu(hidden[b,h])
+                float relu_val = max(pre_relu, 0.0);
+                atomicAddFloat(uint(w2_off + h), d_out * relu_val);
+            }
+        }
+
+        // d_b2 += d_output[b]  (once per b)
+        if (c == 0) {
+            atomicAddFloat(uint(b2_off), d_out);
+        }
+    }
+}

@@ -1,0 +1,85 @@
+#version 450
+
+// ============================================================
+// conv2d_backward_input.comp — Gradient w.r.t. conv2d input
+// ============================================================
+// Given upstream gradient dL/d_output [B, C_out, H_out, W_out],
+// compute dL/d_input [B, C_in, H_in, W_in].
+//
+// This is the "transposed convolution" — for each input position,
+// find which output positions it contributed to, and accumulate
+// the gradient weighted by the kernel.
+//
+// One thread per (batch, in_channel, in_y, in_x).
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly  buffer UpstreamBuf { float d_output[]; };  // [B, C_out, H_out, W_out]
+layout(std430, binding = 1) readonly  buffer WeightBuf   { float weights[];  };  // [C_out, C_in, K, K]
+layout(std430, binding = 2) writeonly buffer GradBuf     { float d_input[];  };  // [B, C_in, H_in, W_in]
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int in_channels;
+    int out_channels;
+    int in_h;
+    int in_w;
+    int out_h;
+    int out_w;
+    int kernel_size;
+    int stride;
+    int padding;
+    int relu;           // unused here but keeps push layout consistent
+    int relu_mask_mode; // 1 = apply ReLU mask from forward activations
+};
+
+// Optional: forward activations for ReLU mask
+layout(std430, binding = 3) readonly buffer FwdActBuf { float fwd_input[]; };
+
+void main() {
+    int ix = int(gl_GlobalInvocationID.x);
+    int iy = int(gl_GlobalInvocationID.y);
+    int bic = int(gl_GlobalInvocationID.z);
+    int b = bic / in_channels;
+    int ic = bic % in_channels;
+
+    if (ix >= in_w || iy >= in_h || b >= batch_size) return;
+
+    float grad = 0.0;
+
+    // For each output channel and kernel position, check if this
+    // input position contributed to an output position
+    for (int oc = 0; oc < out_channels; oc++) {
+        for (int ky = 0; ky < kernel_size; ky++) {
+            for (int kx = 0; kx < kernel_size; kx++) {
+                // Which output position does (iy, ix) contribute to
+                // via kernel position (ky, kx)?
+                // oy * stride - padding + ky = iy
+                // → oy = (iy + padding - ky) / stride
+                int oy_num = iy + padding - ky;
+                int ox_num = ix + padding - kx;
+
+                if (oy_num % stride != 0 || ox_num % stride != 0) continue;
+                int oy = oy_num / stride;
+                int ox = ox_num / stride;
+
+                if (oy < 0 || oy >= out_h || ox < 0 || ox >= out_w) continue;
+
+                int d_out_idx = ((b * out_channels + oc) * out_h + oy) * out_w + ox;
+                int w_idx = ((oc * in_channels + ic) * kernel_size + ky) * kernel_size + kx;
+
+                grad += d_output[d_out_idx] * weights[w_idx];
+            }
+        }
+    }
+
+    // Apply ReLU mask if the forward input was <= 0
+    if (relu_mask_mode != 0) {
+        int in_idx = ((b * in_channels + ic) * in_h + iy) * in_w + ix;
+        if (fwd_input[in_idx] <= 0.0) grad = 0.0;
+    }
+
+    int out_idx = ((b * in_channels + ic) * in_h + iy) * in_w + ix;
+    d_input[out_idx] = grad;
+}

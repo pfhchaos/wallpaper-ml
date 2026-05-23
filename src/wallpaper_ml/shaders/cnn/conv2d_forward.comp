@@ -1,0 +1,79 @@
+#version 450
+
+// ============================================================
+// conv2d_forward.comp — 2D convolution + bias + ReLU
+// ============================================================
+// One thread per output element: (batch, out_channel, out_y, out_x)
+//
+// Supports stride and padding. No batch norm — just conv + bias + ReLU.
+//
+// Buffer layout:
+//   input:   [B, C_in, H_in, W_in] contiguous in NCHW order
+//   weights: [C_out, C_in, KH, KW] contiguous
+//   bias:    [C_out]
+//   output:  [B, C_out, H_out, W_out] contiguous
+//
+// Push constants provide dimensions for this specific layer.
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuf   { float input_data[];  };
+layout(std430, binding = 1) readonly  buffer WeightBuf  { float weights[];     };
+layout(std430, binding = 2) readonly  buffer BiasBuf    { float bias[];        };
+layout(std430, binding = 3) writeonly buffer OutputBuf  { float output_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int in_channels;
+    int out_channels;
+    int in_h;
+    int in_w;
+    int out_h;
+    int out_w;
+    int kernel_size;
+    int stride;
+    int padding;
+    int relu;       // 1 = apply ReLU, 0 = skip
+};
+
+void main() {
+    // Each thread computes one output pixel
+    int ox = int(gl_GlobalInvocationID.x);
+    int oy = int(gl_GlobalInvocationID.y);
+
+    // Batch and output channel are packed into z dimension
+    int boc = int(gl_GlobalInvocationID.z);
+    int b = boc / out_channels;
+    int oc = boc % out_channels;
+
+    if (ox >= out_w || oy >= out_h || b >= batch_size) return;
+
+    float sum = bias[oc];
+
+    // Convolution: accumulate over input channels and kernel positions
+    for (int ic = 0; ic < in_channels; ic++) {
+        for (int ky = 0; ky < kernel_size; ky++) {
+            for (int kx = 0; kx < kernel_size; kx++) {
+                int iy = oy * stride - padding + ky;
+                int ix = ox * stride - padding + kx;
+
+                if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w) {
+                    // Input index: [b, ic, iy, ix]
+                    int in_idx = ((b * in_channels + ic) * in_h + iy) * in_w + ix;
+                    // Weight index: [oc, ic, ky, kx]
+                    int w_idx = ((oc * in_channels + ic) * kernel_size + ky) * kernel_size + kx;
+
+                    sum += input_data[in_idx] * weights[w_idx];
+                }
+            }
+        }
+    }
+
+    // ReLU
+    if (relu != 0 && sum < 0.0) sum = 0.0;
+
+    // Output index: [b, oc, oy, ox]
+    int out_idx = ((b * out_channels + oc) * out_h + oy) * out_w + ox;
+    output_data[out_idx] = sum;
+}

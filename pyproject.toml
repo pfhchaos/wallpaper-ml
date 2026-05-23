@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wallpaper-ml"
+version = "0.1.0"
+description = "Vulkan compute ML framework — PyTorch-style layers, losses, models for audio-reactive wallpapers"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+wallpaper_ml = ["shaders/cnn/*.comp", "shaders/rnn/*.comp"]

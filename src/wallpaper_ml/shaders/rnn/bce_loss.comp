@@ -1,0 +1,62 @@
+#version 450
+
+// ============================================================
+// bce_loss.comp — sigmoid + binary cross-entropy + gradient
+// ============================================================
+// Single-channel regression alternative to the 3-class cross_entropy
+// shader. For the beat-detection RNN's continuous-activation
+// reformulation: model outputs one logit per frame, target is a
+// continuous beat-probability in [0, 1] (= 1 - non_beat_probability
+// from BeatNet's soft labels). Sigmoid the logit, compute BCE
+// against the soft target, accumulate per-batch.
+//
+// Numerically-stable BCE-with-logits formulation:
+//   loss = max(z, 0) - z * t + log(1 + exp(-|z|))
+// where z = logit. Avoids overflow when |z| is large.
+//
+// Gradient w.r.t. logit (the clean part of BCE-with-sigmoid):
+//   d_loss/d_z = sigmoid(z) - target
+//
+// Just like softmax CE gives (prob - target) for the input gradient,
+// sigmoid BCE gives (sigmoid - target). Same structure, different
+// channel count.
+// ============================================================
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer LogitsBuf  { float logits[]; };
+layout(std430, binding = 1) readonly buffer TargetsBuf { float targets[]; };
+layout(std430, binding = 2)          buffer GradAccBuf { float grad_acc[]; };
+layout(std430, binding = 3)          buffer LossAccBuf { float loss_acc[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int target_offset; // float-element offset into targets — lets the caller
+                       // share one (B, T) targets buffer across all T per-
+                       // timestep dispatches.
+    float t_inv;       // 1.0 / T — averages loss + grad over the sequence.
+};
+
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= batch_size) return;
+
+    float z = logits[b];                       // single logit per batch element
+    float t = targets[target_offset + b];      // soft target in [0, 1]
+
+    // Numerically-stable BCE-with-logits
+    float abs_z = abs(z);
+    float max_z = max(z, 0.0);
+    float loss = max_z - z * t + log(1.0 + exp(-abs_z));
+
+    // sigmoid(z) — gradient w.r.t. z is (sigmoid(z) - t)
+    float sigmoid_z = 1.0 / (1.0 + exp(-z));
+    float grad = sigmoid_z - t;
+
+    // Per-element accumulation. Loss is averaged over batch on download
+    // by the caller; gradient is scaled by 1/B so the running grad after
+    // T dispatches is mean-over-batch mean-over-timesteps.
+    float inv_b = 1.0 / float(batch_size);
+    grad_acc[b] += grad * inv_b * t_inv;
+    loss_acc[b] += loss * t_inv;
+}

@@ -1,0 +1,79 @@
+#version 450
+
+// ============================================================
+// gap_mlp_forward.comp — Global Average Pool + MLP → scalar
+// ============================================================
+// One thread per batch item.
+//
+// 1. Average pool: for each channel, average all spatial positions
+// 2. Linear1: pooled × W1 + b1 → hidden[hidden_dim]
+// 3. ReLU: max(0, hidden)
+// 4. Linear2: hidden × W2 + b2 → scalar
+//
+// Input:   [B, C, H, W] contiguous
+// Weights: [W1: C×hidden_dim] [b1: hidden_dim] [W2: hidden_dim] [b2: 1]
+// Output:  [B] scalars
+// Pooled:  [B, C] intermediate (saved for backward)
+// Hidden:  [B, hidden_dim] pre-ReLU activations (saved for backward)
+// ============================================================
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuf   { float input_data[]; };
+layout(std430, binding = 1) readonly  buffer WeightBuf  { float weights[]; };
+layout(std430, binding = 2)           buffer PooledBuf  { float pooled[]; };     // [B, C] read+write
+layout(std430, binding = 3) writeonly buffer OutputBuf  { float output_data[]; }; // [B]
+layout(std430, binding = 4) writeonly buffer HiddenBuf  { float hidden[]; };     // [B, hidden_dim]
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int channels;
+    int height;
+    int width;
+    int hidden_dim;
+};
+
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= batch_size) return;
+
+    int spatial = height * width;
+    float inv_spatial = 1.0 / float(spatial);
+    int C = channels;
+    int H = hidden_dim;
+
+    // Weight layout offsets
+    int w1_off = 0;               // W1: [C × H]
+    int b1_off = C * H;           // b1: [H]
+    int w2_off = C * H + H;       // W2: [H]
+    int b2_off = C * H + H + H;   // b2: [1]
+
+    // 1. Global average pool
+    // Store pooled values temporarily in an array (C <= 128 for all configs)
+    float pool_val;
+    for (int c = 0; c < C; c++) {
+        float sum = 0.0;
+        int base = (b * C + c) * spatial;
+        for (int i = 0; i < spatial; i++) {
+            sum += input_data[base + i];
+        }
+        pool_val = sum * inv_spatial;
+        pooled[b * C + c] = pool_val;
+    }
+
+    // 2. Linear1 + save pre-ReLU + ReLU
+    float score = weights[b2_off];  // bias2
+    for (int h = 0; h < H; h++) {
+        float val = weights[b1_off + h];  // bias1[h]
+        for (int c = 0; c < C; c++) {
+            val += pooled[b * C + c] * weights[w1_off + c * H + h];
+        }
+        hidden[b * H + h] = val;  // save pre-ReLU for backward
+        float relu_val = max(val, 0.0);
+
+        // 3. Accumulate Linear2: score += relu_val * W2[h]
+        score += relu_val * weights[w2_off + h];
+    }
+
+    output_data[b] = score;
+}

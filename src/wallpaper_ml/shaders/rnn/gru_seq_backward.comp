@@ -1,0 +1,251 @@
+#version 450
+
+// ============================================================
+// gru_seq_backward.comp — GRU BPTT over T timesteps in one dispatch
+// ============================================================
+// Single-dispatch BPTT alternative to gru_backward.comp's per-timestep
+// dispatch. Each workgroup handles one batch element b and runs a
+// T-step backward loop with the recurrent hidden-state gradient held
+// in shared memory across iterations.
+//
+// Replaces T per-timestep dispatches (the BPTT loop inside
+// VkGRU.backward) with one. At T=256 that's a ~256x reduction in
+// dispatch overhead for the backward pass, which is the dominant
+// remaining cost after forward went to seq mode.
+//
+// True per-timestep upstream gradient handling: each iteration's
+// upstream contribution (from the layer above, e.g. linear_out's
+// per-timestep grad) is read from a (T, B, H) buffer at offset
+// (t*B+b)*H and added to the running recurrent grad. This
+// supersedes the previous "BPTT approximation" that only seeded the
+// last timestep's upstream — every timestep's grad now properly
+// flows back through the chain.
+//
+// Math is bit-identical to gru_backward.comp's single-step body,
+// just wrapped in a t-loop with offsets. Same weight gradient
+// accumulation via CAS atomics on uint-aliased float buffers.
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer InputSeqBuf      { float x_seq[]; };
+layout(std430, binding = 1) readonly  buffer UpstreamDhSeqBuf { float upstream_dh[]; };
+layout(std430, binding = 2) writeonly buffer GradXSeqBuf      { float dx_seq[]; };
+layout(std430, binding = 3) readonly  buffer CacheBuf         { float cache[]; };
+layout(std430, binding = 4) readonly  buffer WBuf             { float W[]; };
+layout(std430, binding = 5) readonly  buffer UBuf             { float U_data[]; };
+layout(std430, binding = 6) readonly  buffer BiasBuf          { float bias[]; };
+layout(std430, binding = 7)           buffer GradWBuf         { uint grad_W[]; };
+layout(std430, binding = 8)           buffer GradUBuf         { uint grad_U[]; };
+layout(std430, binding = 9)           buffer GradBiasBuf      { uint grad_bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    int T;
+};
+
+// Per-timestep shared state (overwritten each iteration)
+shared float s_dz_pre[64];
+shared float s_dr_pre[64];
+shared float s_dn_pre[64];
+shared float s_d_ruh[64];
+shared float s_dh_prev_direct[64];
+
+// Running recurrent dh — persists across iterations of the BPTT loop
+shared float s_running_dh[64];
+
+void main() {
+    int j = int(gl_LocalInvocationID.x);
+    int b = int(gl_WorkGroupID.x);
+
+    if (b >= batch_size) return;
+    bool is_active = (j < hidden_size);
+
+    int H = hidden_size;
+    int I = input_size;
+    int B = batch_size;
+    int w_gate_stride = I * H;
+    int u_gate_stride = H * H;
+
+    // BPTT starts with running_dh = 0 (no recurrent grad flowing from "beyond" T)
+    if (is_active) s_running_dh[j] = 0.0;
+    barrier();
+    memoryBarrierShared();
+
+    // BPTT: iterate timesteps backwards
+    for (int t = T - 1; t >= 0; t--) {
+        int t_offset_x = (t * B + b) * I;
+        int t_offset_h = (t * B + b) * H;
+        int c_base = (t * B + b) * 4 * H;
+
+        float dz_pre_val = 0.0, dr_pre_val = 0.0, dn_pre_val = 0.0, d_ruh_val = 0.0;
+
+        if (is_active) {
+            // Total dh = this timestep's upstream contribution + recurrent grad
+            // accumulated from later timesteps' BPTT.
+            float dh_j = upstream_dh[t_offset_h + j] + s_running_dh[j];
+
+            // Load cached forward activations
+            float z_val = cache[c_base + 0 * H + j];
+            float r_val = cache[c_base + 1 * H + j];
+            float n_val = cache[c_base + 2 * H + j];
+            float h_prev = cache[c_base + 3 * H + j];
+
+            // GRU backward math (same as gru_backward.comp's single-step body)
+            float dn_val = dh_j * (1.0 - z_val);
+            float dz_val = dh_j * (h_prev - n_val);
+            float dh_prev_direct = dh_j * z_val;
+
+            // tanh / sigmoid derivatives
+            dn_pre_val = dn_val * (1.0 - n_val * n_val);
+            dz_pre_val = dz_val * z_val * (1.0 - z_val);
+
+            // (U_n @ h_prev + b_Un)[j] for the reset-gate chain
+            float uh_n_plus_b = bias[5 * H + j];
+            for (int k = 0; k < H; k++) {
+                float hk = cache[c_base + 3 * H + k];
+                uh_n_plus_b += hk * U_data[2 * u_gate_stride + k * H + j];
+            }
+            float dr_from_n = dn_pre_val * uh_n_plus_b;
+            dr_pre_val = dr_from_n * r_val * (1.0 - r_val);
+            d_ruh_val = dn_pre_val * r_val;
+
+            // Stage for Phase 2 (recurrent dh) and Phase 3 (dx)
+            s_dz_pre[j] = dz_pre_val;
+            s_dr_pre[j] = dr_pre_val;
+            s_dn_pre[j] = dn_pre_val;
+            s_d_ruh[j] = d_ruh_val;
+            s_dh_prev_direct[j] = dh_prev_direct;
+
+            // --- Accumulate W gradients (atomic CAS) ---
+            for (int i = 0; i < I; i++) {
+                float xi = x_seq[t_offset_x + i];
+                if (dz_pre_val != 0.0) {
+                    uint tgt = uint(0 * w_gate_stride + i * H + j);
+                    uint exp_val = grad_W[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dz_pre_val * xi);
+                        uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+                if (dr_pre_val != 0.0) {
+                    uint tgt = uint(1 * w_gate_stride + i * H + j);
+                    uint exp_val = grad_W[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dr_pre_val * xi);
+                        uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+                if (dn_pre_val != 0.0) {
+                    uint tgt = uint(2 * w_gate_stride + i * H + j);
+                    uint exp_val = grad_W[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dn_pre_val * xi);
+                        uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+            }
+
+            // --- Accumulate U gradients ---
+            for (int k = 0; k < H; k++) {
+                float hk = cache[c_base + 3 * H + k];
+                if (dz_pre_val != 0.0) {
+                    uint tgt = uint(0 * u_gate_stride + k * H + j);
+                    uint exp_val = grad_U[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dz_pre_val * hk);
+                        uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+                if (dr_pre_val != 0.0) {
+                    uint tgt = uint(1 * u_gate_stride + k * H + j);
+                    uint exp_val = grad_U[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dr_pre_val * hk);
+                        uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+                if (d_ruh_val != 0.0) {
+                    uint tgt = uint(2 * u_gate_stride + k * H + j);
+                    uint exp_val = grad_U[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + d_ruh_val * hk);
+                        uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+            }
+
+            // --- Accumulate bias gradients ---
+            // Layout: [bW_z, bW_r, bW_n, bU_z, bU_r, bU_n]
+            uint bj = uint(j);
+            { uint tgt = 0u * uint(H) + bj; uint e = grad_bias[tgt];
+              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dz_pre_val);
+              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+            { uint tgt = 1u * uint(H) + bj; uint e = grad_bias[tgt];
+              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dr_pre_val);
+              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+            { uint tgt = 2u * uint(H) + bj; uint e = grad_bias[tgt];
+              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dn_pre_val);
+              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+            { uint tgt = 3u * uint(H) + bj; uint e = grad_bias[tgt];
+              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dz_pre_val);
+              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+            { uint tgt = 4u * uint(H) + bj; uint e = grad_bias[tgt];
+              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dr_pre_val);
+              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+            { uint tgt = 5u * uint(H) + bj; uint e = grad_bias[tgt];
+              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+d_ruh_val);
+              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+        } else {
+            // Inactive thread: zero shared so Phase 2/3 sums don't read garbage
+            s_dz_pre[j] = 0.0;
+            s_dr_pre[j] = 0.0;
+            s_dn_pre[j] = 0.0;
+            s_d_ruh[j] = 0.0;
+            s_dh_prev_direct[j] = 0.0;
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        // --- Phase 2: dh_recurrent = dh_prev_direct + U^T @ gate_grads ---
+        // This becomes the running_dh for the next (earlier) timestep.
+        if (is_active) {
+            float dh_recurrent = 0.0;
+            for (int k = 0; k < H; k++) {
+                dh_recurrent += s_dz_pre[k] * U_data[0 * u_gate_stride + j * H + k];
+                dh_recurrent += s_dr_pre[k] * U_data[1 * u_gate_stride + j * H + k];
+                dh_recurrent += s_d_ruh[k] * U_data[2 * u_gate_stride + j * H + k];
+            }
+            s_running_dh[j] = s_dh_prev_direct[j] + dh_recurrent;
+        }
+
+        // --- Phase 3: dx[t][i] = W^T @ gate_grads ---
+        if (j < I) {
+            float dx_val = 0.0;
+            for (int k = 0; k < H; k++) {
+                dx_val += s_dz_pre[k] * W[0 * w_gate_stride + j * H + k];
+                dx_val += s_dr_pre[k] * W[1 * w_gate_stride + j * H + k];
+                dx_val += s_dn_pre[k] * W[2 * w_gate_stride + j * H + k];
+            }
+            dx_seq[t_offset_x + j] = dx_val;
+        }
+
+        barrier();
+        memoryBarrierShared();
+    }
+}

@@ -1,0 +1,54 @@
+#version 450
+
+// ============================================================
+// linear_forward.comp — Dense linear layer: y = x @ W + b
+// ============================================================
+// One invocation per (batch, output_unit) pair.
+//
+// Input:  [B, in_features]
+// Weight: [in_features, out_features] — column-major for coalesced reads
+// Bias:   [out_features]
+// Output: [B, out_features]
+//
+// Optional ReLU via push constant flag.
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuf   { float x_data[]; };
+layout(std430, binding = 1) readonly  buffer WeightBuf  { float W[]; };
+layout(std430, binding = 2) readonly  buffer BiasBuf    { float bias[]; };
+layout(std430, binding = 3) writeonly buffer OutputBuf  { float y_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int in_features;
+    int out_features;
+    int relu;          // 1 = apply ReLU, 0 = linear
+    int input_offset;  // Read x_data starting at this float-element offset.
+                       // Lets the caller pre-upload a (B, T, in_features)
+                       // sequence and slice per-timestep without copies —
+                       // each per-timestep dispatch passes the right offset
+                       // instead of re-uploading just that slice.
+};
+
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int total = batch_size * out_features;
+    if (idx >= total) return;
+
+    int b = idx / out_features;
+    int j = idx % out_features;
+
+    float sum = bias[j];
+    int x_base = input_offset + b * in_features;
+
+    // W layout: [in_features, out_features] — W[i][j] at i * out_features + j
+    for (int i = 0; i < in_features; i++) {
+        sum += x_data[x_base + i] * W[i * out_features + j];
+    }
+
+    if (relu == 1 && sum < 0.0) sum = 0.0;
+
+    y_data[b * out_features + j] = sum;
+}

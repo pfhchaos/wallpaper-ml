@@ -1,0 +1,108 @@
+#version 450
+
+// ============================================================
+// conv2d_backward_weights.comp — Gradient w.r.t. conv2d weights + bias
+// ============================================================
+// Given upstream gradient dL/d_output [B, C_out, H_out, W_out]
+// and forward input [B, C_in, H_in, W_in],
+// compute dL/d_weights [C_out, C_in, K, K] and dL/d_bias [C_out].
+//
+// One thread per (out_channel, in_channel, ky, kx).
+// Each thread accumulates across all batch items and spatial positions.
+//
+// Uses CAS-emulated float atomics for accumulation since multiple
+// threads may write to the same weight gradient.
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer UpstreamBuf { float d_output[];  };  // [B, C_out, H_out, W_out]
+layout(std430, binding = 1) readonly buffer InputBuf    { float input_data[]; }; // [B, C_in, H_in, W_in]
+layout(std430, binding = 2) buffer         GradWBuf    { uint d_weights_u[]; }; // [C_out * C_in * K * K + C_out] as uint
+layout(std430, binding = 3) readonly buffer FwdOutBuf  { float fwd_output[]; }; // [B, C_out, H_out, W_out] for ReLU mask
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int in_channels;
+    int out_channels;
+    int in_h;
+    int in_w;
+    int out_h;
+    int out_w;
+    int kernel_size;
+    int stride;
+    int padding;
+    int relu;  // 1 = upstream grad was through ReLU, mask by fwd_output > 0
+};
+
+// CAS-emulated float atomicAdd
+void atomicAddFloat(uint idx, float val) {
+    uint old_val, new_val, assumed;
+    old_val = d_weights_u[idx];
+    do {
+        assumed = old_val;
+        new_val = floatBitsToUint(uintBitsToFloat(assumed) + val);
+        old_val = atomicCompSwap(d_weights_u[idx], assumed, new_val);
+    } while (old_val != assumed);
+}
+
+void main() {
+    int tid = int(gl_GlobalInvocationID.x);
+
+    int n_weights = out_channels * in_channels * kernel_size * kernel_size;
+    int n_total = n_weights + out_channels;  // weights + bias
+
+    if (tid >= n_total) return;
+
+    if (tid < n_weights) {
+        // Weight gradient: tid = ((oc * C_in + ic) * K + ky) * K + kx
+        int kx = tid % kernel_size;
+        int rem = tid / kernel_size;
+        int ky = rem % kernel_size;
+        rem = rem / kernel_size;
+        int ic = rem % in_channels;
+        int oc = rem / in_channels;
+
+        float grad = 0.0;
+
+        for (int b = 0; b < batch_size; b++) {
+            for (int oy = 0; oy < out_h; oy++) {
+                for (int ox = 0; ox < out_w; ox++) {
+                    int d_out_idx = ((b * out_channels + oc) * out_h + oy) * out_w + ox;
+                    float d_out = d_output[d_out_idx];
+
+                    // ReLU mask: if forward output was <= 0, gradient is 0
+                    if (relu != 0 && fwd_output[d_out_idx] <= 0.0) continue;
+
+                    int iy = oy * stride - padding + ky;
+                    int ix = ox * stride - padding + kx;
+
+                    if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w) {
+                        int in_idx = ((b * in_channels + ic) * in_h + iy) * in_w + ix;
+                        grad += d_out * input_data[in_idx];
+                    }
+                }
+            }
+        }
+
+        atomicAddFloat(uint(tid), grad);
+
+    } else {
+        // Bias gradient: tid - n_weights = oc
+        int oc = tid - n_weights;
+        float grad = 0.0;
+
+        for (int b = 0; b < batch_size; b++) {
+            for (int oy = 0; oy < out_h; oy++) {
+                for (int ox = 0; ox < out_w; ox++) {
+                    int d_out_idx = ((b * out_channels + oc) * out_h + oy) * out_w + ox;
+                    float d_out = d_output[d_out_idx];
+                    if (relu != 0 && fwd_output[d_out_idx] <= 0.0) continue;
+                    grad += d_out;
+                }
+            }
+        }
+
+        atomicAddFloat(uint(tid), grad);
+    }
+}

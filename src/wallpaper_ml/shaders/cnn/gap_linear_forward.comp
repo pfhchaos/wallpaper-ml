@@ -1,0 +1,53 @@
+#version 450
+
+// ============================================================
+// gap_linear_forward.comp — Global Average Pool + Linear → scalar
+// ============================================================
+// One thread per batch item.
+//
+// 1. Average pool: for each channel, average all spatial positions
+// 2. Linear: dot product of pooled vector with weights + bias
+//
+// Input:  [B, C, H, W] contiguous
+// Weights: [C] (linear weights) + [1] (linear bias) = C+1 floats
+// Output: [B] scalars
+// Pooled: [B, C] intermediate (written for backward pass)
+// ============================================================
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuf   { float input_data[]; };
+layout(std430, binding = 1) readonly  buffer WeightBuf  { float linear_weights[]; };  // [C] weights + [1] bias
+layout(std430, binding = 2) writeonly buffer PooledBuf  { float pooled[]; };           // [B, C]
+layout(std430, binding = 3) writeonly buffer OutputBuf  { float output_data[]; };      // [B]
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int channels;
+    int height;
+    int width;
+};
+
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= batch_size) return;
+
+    int spatial = height * width;
+    float inv_spatial = 1.0 / float(spatial);
+
+    // Global average pool: mean over H×W for each channel
+    float score = linear_weights[channels];  // bias term
+
+    for (int c = 0; c < channels; c++) {
+        float sum = 0.0;
+        int base = (b * channels + c) * spatial;
+        for (int i = 0; i < spatial; i++) {
+            sum += input_data[base + i];
+        }
+        float avg = sum * inv_spatial;
+        pooled[b * channels + c] = avg;
+        score += avg * linear_weights[c];
+    }
+
+    output_data[b] = score;
+}

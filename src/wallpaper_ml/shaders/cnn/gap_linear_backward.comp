@@ -1,0 +1,72 @@
+#version 450
+
+// ============================================================
+// gap_linear_backward.comp — Backward through Linear + GAP
+// ============================================================
+// Given upstream gradient dL/d_output (scalar per batch item),
+// compute:
+//   dL/d_pooled[b,c] = dL/d_output[b] * linear_weight[c]
+//   dL/d_input[b,c,h,w] = dL/d_pooled[b,c] / (H * W)
+//   dL/d_linear_weight[c] += sum_b(dL/d_output[b] * pooled[b,c])
+//   dL/d_linear_bias += sum_b(dL/d_output[b])
+//
+// One thread per (batch, channel, spatial_y, spatial_x).
+// Weight gradients accumulated via atomics (small — only C+1 values).
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly  buffer UpstreamGrad { float d_output[];    };  // [B]
+layout(std430, binding = 1) readonly  buffer PooledBuf    { float pooled[];      };  // [B, C]
+layout(std430, binding = 2) readonly  buffer WeightBuf    { float linear_weights[]; }; // [C+1]
+layout(std430, binding = 3) writeonly buffer GradInputBuf { float d_input[];     };  // [B, C, H, W]
+layout(std430, binding = 4) buffer          GradWeightBuf { uint d_weights_u[];  };  // [C+1] as uint for CAS atomics
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int channels;
+    int height;
+    int width;
+};
+
+// CAS-emulated float atomicAdd
+void atomicAddFloat(uint idx, float val) {
+    uint old_val, new_val, assumed;
+    old_val = d_weights_u[idx];
+    do {
+        assumed = old_val;
+        new_val = floatBitsToUint(uintBitsToFloat(assumed) + val);
+        old_val = atomicCompSwap(d_weights_u[idx], assumed, new_val);
+    } while (old_val != assumed);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    int bc = int(gl_GlobalInvocationID.z);
+    int b = bc / channels;
+    int c = bc % channels;
+
+    if (x >= width || y >= height || b >= batch_size) return;
+
+    float d_out = d_output[b];
+    float w_c = linear_weights[c];
+    float inv_spatial = 1.0 / float(height * width);
+
+    // dL/d_input = dL/d_output * linear_weight[c] / (H * W)
+    float d_inp = d_out * w_c * inv_spatial;
+    int idx = ((b * channels + c) * height + y) * width + x;
+    d_input[idx] = d_inp;
+
+    // dL/d_linear_weight[c] = sum_b(d_output[b] * pooled[b,c])
+    // Only one thread per (b,c) should contribute — use (x==0, y==0)
+    if (x == 0 && y == 0) {
+        float d_w = d_out * pooled[b * channels + c];
+        atomicAddFloat(uint(c), d_w);
+
+        // dL/d_bias (index C in weights array) — one thread per batch item
+        if (c == 0) {
+            atomicAddFloat(uint(channels), d_out);
+        }
+    }
+}

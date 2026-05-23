@@ -1,0 +1,137 @@
+#version 450
+
+// ============================================================
+// gru_seq_forward.comp — GRU forward over T_sub timesteps in one dispatch
+// ============================================================
+// Single-dispatch alternative to gru_forward.comp's per-timestep
+// dispatch. Each workgroup handles one batch element b and runs a
+// T_sub-step inner loop over the input sequence, keeping the hidden
+// state in shared memory across iterations.
+//
+// Lets the caller pre-upload (B, T, in_features) once per batch and
+// run forward for all T timesteps in a single dispatch — going from
+// 256 dispatches per layer per batch to 1.
+//
+// Sub-batching for memory limits: caller can split a T-step batch
+// into chunks of t_count timesteps each by calling this shader
+// multiple times with different (t_start, t_count). Hidden state
+// persists in HiddenBuf across calls (read at start, written at end),
+// so chunks chain correctly. With t_start=0, t_count=T it's a single
+// dispatch for the whole batch.
+//
+// Same GRU math as gru_forward.comp (PyTorch GRU convention with
+// split input/hidden biases). Same activation cache layout for BPTT.
+// ============================================================
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer InputSeqBuf  { float x_seq[]; };
+layout(std430, binding = 1)           buffer HiddenBuf    { float h_data[]; };
+layout(std430, binding = 2) readonly  buffer WBuf         { float W[]; };
+layout(std430, binding = 3) readonly  buffer UBuf         { float U[]; };
+layout(std430, binding = 4) readonly  buffer BiasBuf      { float bias[]; };
+layout(std430, binding = 5) writeonly buffer OutputSeqBuf { float out_seq[]; };
+layout(std430, binding = 6) writeonly buffer CacheBuf     { float cache[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    int t_start;   // first timestep this dispatch processes
+    int t_count;   // number of timesteps this dispatch processes
+};
+
+// Hidden state held in shared memory across the inner timestep loop.
+// Sized at 64 to match local_size_x — supports hidden_size up to 64.
+// Two slots (current + next) so we can write next-step values without
+// clobbering current-step reads from sibling threads.
+shared float h_shared[64];
+shared float h_next_shared[64];
+
+void main() {
+    int j = int(gl_LocalInvocationID.x);
+    int b = int(gl_WorkGroupID.x);
+
+    if (b >= batch_size) return;
+    bool is_active = (j < hidden_size);
+
+    int H = hidden_size;
+    int I = input_size;
+    int B = batch_size;
+    int w_gate_stride = I * H;
+    int u_gate_stride = H * H;
+
+    // Load hidden state for this batch element into shared memory.
+    if (is_active) h_shared[j] = h_data[b * H + j];
+    barrier();
+    memoryBarrierShared();
+
+    for (int t = 0; t < t_count; t++) {
+        int t_global = t_start + t;
+        int x_base = (t_global * B + b) * I;
+        int out_base = (t_global * B + b) * H;
+        int c_base = (t_global * B + b) * 4 * H;
+
+        float h_prev = is_active ? h_shared[j] : 0.0;
+
+        if (is_active) {
+            // W @ x for all three gates (z, r, h-candidate)
+            float wx_z = 0.0, wx_r = 0.0, wx_h = 0.0;
+            for (int i = 0; i < I; i++) {
+                float xi = x_seq[x_base + i];
+                wx_z += xi * W[0 * w_gate_stride + i * H + j];
+                wx_r += xi * W[1 * w_gate_stride + i * H + j];
+                wx_h += xi * W[2 * w_gate_stride + i * H + j];
+            }
+
+            // U @ h_prev for all three gates — reads shared hidden state
+            float uh_z = 0.0, uh_r = 0.0, uh_n = 0.0;
+            for (int k = 0; k < H; k++) {
+                float hk = h_shared[k];
+                uh_z += hk * U[0 * u_gate_stride + k * H + j];
+                uh_r += hk * U[1 * u_gate_stride + k * H + j];
+                uh_n += hk * U[2 * u_gate_stride + k * H + j];
+            }
+
+            // Bias layout: [bW_z | bW_r | bW_n | bU_z | bU_r | bU_n], each H floats
+            float bz = bias[0 * H + j] + bias[3 * H + j];
+            float br = bias[1 * H + j] + bias[4 * H + j];
+            float z = 1.0 / (1.0 + exp(-(wx_z + uh_z + bz)));
+            float r = 1.0 / (1.0 + exp(-(wx_r + uh_r + br)));
+
+            // PyTorch GRU candidate: n = tanh(W_n @ x + b_Wn + r * (U_n @ h + b_Un))
+            float b_wn = bias[2 * H + j];
+            float b_un = bias[5 * H + j];
+            float h_hat = tanh(wx_h + b_wn + r * (uh_n + b_un));
+
+            // h_new = (1 - z) * n + z * h_prev
+            float h_new = (1.0 - z) * h_hat + z * h_prev;
+
+            // Write to output sequence
+            out_seq[out_base + j] = h_new;
+
+            // Cache for BPTT
+            cache[c_base + 0 * H + j] = z;
+            cache[c_base + 1 * H + j] = r;
+            cache[c_base + 2 * H + j] = h_hat;
+            cache[c_base + 3 * H + j] = h_prev;
+
+            // Stage h_new in next-shared so other threads' h_prev reads
+            // in this iteration still see the old value.
+            h_next_shared[j] = h_new;
+        }
+
+        // Synchronize: all threads done reading h_shared and writing h_next_shared
+        barrier();
+        memoryBarrierShared();
+
+        // Promote h_next_shared → h_shared for next iteration
+        if (is_active) h_shared[j] = h_next_shared[j];
+        barrier();
+        memoryBarrierShared();
+    }
+
+    // Write final hidden state back to global memory so subsequent
+    // dispatches (sub-batching) or backward see the up-to-date state.
+    if (is_active) h_data[b * H + j] = h_shared[j];
+}
