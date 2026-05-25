@@ -48,8 +48,14 @@ class VkModel:
             layer.zero_grad()
 
     def sgd_step(self, lr: float) -> None:
-        """SGD weight update: w -= lr * grad, then zero grads."""
+        """SGD weight update: w -= lr * grad, then zero grads.
+
+        Layers may transform their gradient buffer before the update via
+        `pre_sgd_step()` (e.g., VkConv2d uses this for per-input-channel LR
+        multipliers in staged-training curricula).
+        """
         for layer in self.layers:
+            layer.pre_sgd_step()
             for param_buf, grad_buf, n in layer.parameters():
                 pipeline = self.gpu.create_pipeline(
                     str(SHADER_DIR / 'sgd_update.comp'),

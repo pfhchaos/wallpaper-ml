@@ -72,6 +72,14 @@ class VkLayer(ABC):
         """Initialize weights with Kaiming uniform. Override per layer."""
         pass
 
+    def pre_sgd_step(self) -> None:
+        """Hook called by VkModel.sgd_step before the per-parameter SGD update.
+
+        Default is no-op. Layers that need to transform gradients before the
+        weight update (e.g., per-channel LR scaling) override this.
+        """
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Conv2d
@@ -121,6 +129,48 @@ class VkConv2d(VkLayer):
         # Saved for backward
         self._saved_input: VkBuffer | None = None
         self._saved_output: VkBuffer | None = None
+
+        # Per-input-channel gradient multiplier (lazily allocated). When set,
+        # each input channel's kernel gradient is scaled by its multiplier
+        # before the SGD step — enabling differential per-channel learning
+        # rate for staged-training curricula.
+        self._grad_mult_buf: VkBuffer | None = None
+        self._grad_mult_active: bool = False
+
+    def set_per_input_channel_lr_mult(self, mults: np.ndarray) -> None:
+        """Set per-input-channel LR multipliers (shape = (in_channels,)).
+
+        Each value scales the kernel gradient for that input channel before
+        the SGD step. Bias gradients are untouched. Setting all-ones is
+        equivalent to disabling the multiplier (no dispatch overhead in that
+        case).
+        """
+        if mults.shape != (self.in_channels,):
+            raise ValueError(
+                f'Expected shape ({self.in_channels},), got {mults.shape}')
+        mults = mults.astype(np.float32)
+        if np.allclose(mults, 1.0):
+            self._grad_mult_active = False
+            return
+        if self._grad_mult_buf is None:
+            self._grad_mult_buf = self.gpu.create_buffer(self.in_channels * 4)
+        self.gpu.upload(self._grad_mult_buf, mults)
+        self._grad_mult_active = True
+
+    def pre_sgd_step(self) -> None:
+        if not self._grad_mult_active or self._grad_mult_buf is None:
+            return
+        n_kernel = self._param_sizes[0]
+        k_sq = self.kernel_size * self.kernel_size
+        pipeline = self.gpu.create_pipeline(
+            str(SHADER_DIR / 'conv2d_scale_grad.comp'),
+            buffers=[self.grad_buf, self._grad_mult_buf],
+            push_constant_size=12,
+        )
+        push = struct.pack('3I', n_kernel, self.in_channels, k_sq)
+        self.gpu.dispatch(pipeline, (n_kernel + 255) // 256,
+                          push_constants=push)
+        pipeline.destroy()
 
     def forward(self, input_buf, batch_size, shape):
         B = batch_size

@@ -1,0 +1,36 @@
+#version 450
+
+// Multiply Conv2d kernel gradient by per-input-channel multipliers.
+//
+// Used for differential per-channel learning rate during staged training.
+// Each channel of conv1 can have its own LR multiplier — e.g., when a new
+// input channel is added to the curriculum, give it a higher LR than the
+// already-converged channels so it finds features before the joint loss
+// landscape locks it out.
+//
+// Operates on the kernel portion of the combined kernel+bias grad buffer.
+// Bias gradients (indices >= n_kernel) are untouched — bias is 1D, no
+// in-channel axis.
+//
+// Kernel layout: idx = ((oc * in_c + ic) * K + ky) * K + kx
+//   => ic = (idx / (K*K)) % in_c
+//
+// Dispatch: (n_kernel + 255) / 256 workgroups along x.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer GradBuf  { float grad[]; };
+layout(set = 0, binding = 1) readonly buffer MultBuf { float mult[]; };
+
+layout(push_constant) uniform PC {
+    uint n_kernel;
+    uint in_channels;
+    uint k_sq;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n_kernel) return;
+    uint ic = (idx / k_sq) % in_channels;
+    grad[idx] *= mult[ic];
+}
