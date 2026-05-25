@@ -43,6 +43,40 @@ def bce_loss_dispatch(gpu: VkCompute, logits_buf: VkBuffer,
     gpu.dispatch(pipeline, n_workgroups, push_constants=push)
 
 
+def bce_loss_multich_dispatch(gpu: VkCompute, logits_buf: VkBuffer,
+                               target_buf: VkBuffer, grad_acc_buf: VkBuffer,
+                               loss_acc_buf: VkBuffer, batch_size: int,
+                               n_classes: int, target_offset_floats: int,
+                               t_inv: float) -> None:
+    """Dispatch the multi-channel BCE shader — N independent sigmoid heads
+    per batch element, per-channel BCE against soft targets.
+
+    Buffer layouts:
+      logits_buf:    (B * n_classes,) — logits[b * n_classes + c]
+      target_buf:    sized for caller's full (B, T, C) array; the shader
+                     reads targets[target_offset_floats + b*n_classes + c]
+      grad_acc_buf:  (B * n_classes,) — accumulated gradients per channel
+      loss_acc_buf:  (B,) — per-element loss SUMMED over channels
+
+    Used by the 3-head beat-RNN (downbeat / any-beat / any-onset). Each
+    head is an independent binary classifier — no softmax constraint, no
+    class-imbalance pathology that killed the original 3-class softmax.
+
+    Per-channel loss breakout is deferred to download time (caller can
+    re-run the shader with single channels, or read individual gradients
+    pre-accumulation if they need per-class F1 during training rather
+    than at validation only).
+    """
+    pipeline = gpu.create_pipeline(
+        str(RNN_SHADER_DIR / 'bce_loss_multich.comp'),
+        buffers=[logits_buf, target_buf, grad_acc_buf, loss_acc_buf],
+        push_constant_size=16,
+    )
+    push = struct.pack('3if', batch_size, n_classes, target_offset_floats, t_inv)
+    n_workgroups = (batch_size + 31) // 32
+    gpu.dispatch(pipeline, n_workgroups, push_constants=push)
+
+
 def cross_entropy_dispatch(gpu: VkCompute, logits_buf: VkBuffer,
                             target_buf: VkBuffer, grad_acc_buf: VkBuffer,
                             loss_acc_buf: VkBuffer,

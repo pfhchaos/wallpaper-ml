@@ -120,15 +120,23 @@ def build_cnn_scorer(gpu: VkCompute, layers_config: list[tuple],
 def build_beat_crnn(gpu: VkCompute, input_size: int = 216,
                     hidden_size: int = 48, n_classes: int = 3,
                     batch_size: int = 8, max_seq_len: int = 128,
-                    seq_mode: bool = False) -> VkModel:
+                    seq_mode: bool = False,
+                    proj_size: int = 32) -> VkModel:
     """Build the beat detection CRNN.
 
-    Architecture: Linear(input→32, ReLU) → GRU(32→hidden) → Linear(hidden→3)
+    Architecture: Linear(input→proj_size, ReLU) → GRU(proj_size→hidden) →
+                  Linear(hidden→n_classes)
 
     Args:
         input_size: features per frame (e.g., 108 CQT + 108 diff = 216)
         hidden_size: GRU hidden units
-        n_classes: output classes (non-beat, beat, downbeat)
+        n_classes: output dimension. Original 3-class softmax used 3
+            (non-beat, beat, downbeat). v1 single-head BCE used 1.
+            v2 multi-head sigmoid BCE uses 3 (downbeat / any-beat /
+            any-onset hierarchical sigmoids).
+        proj_size: input projection dimension. v1 default 32 stayed
+            tight; v2 bumps to 64 to give each of the 3 sigmoid heads
+            more raw spectrum signal to develop distinct features from.
         batch_size: number of independent sequences
         max_seq_len: max BPTT sequence length
         seq_mode: if True, size the linear layers' output buffers for
@@ -137,7 +145,6 @@ def build_beat_crnn(gpu: VkCompute, input_size: int = 216,
             chunk via gru_seq_forward). GRU sizing is unchanged either
             way; it owns the sequence dimension internally.
     """
-    proj_size = 32  # input projection dimension
     linear_batch = batch_size * max_seq_len if seq_mode else batch_size
 
     layers: list[VkLayer] = [

@@ -23,7 +23,11 @@ from .layers import (
     VkLinear,
     VkGRU,
 )
-from .losses import bce_loss_dispatch, cross_entropy_dispatch
+from .losses import (
+    bce_loss_dispatch,
+    bce_loss_multich_dispatch,
+    cross_entropy_dispatch,
+)
 from .models import VkModel, build_cnn_scorer, build_beat_crnn
 
 __all__ = [
@@ -37,6 +41,7 @@ __all__ = [
     'VkGRU',
     'VkModel',
     'bce_loss_dispatch',
+    'bce_loss_multich_dispatch',
     'cross_entropy_dispatch',
     'build_cnn_scorer',
     'build_beat_crnn',

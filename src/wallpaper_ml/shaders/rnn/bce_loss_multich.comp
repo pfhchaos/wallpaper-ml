@@ -1,0 +1,79 @@
+#version 450
+
+// ============================================================
+// bce_loss_multich.comp — multi-channel sigmoid + BCE + gradient
+// ============================================================
+// Multi-head variant of bce_loss.comp: N independent sigmoid heads
+// per batch element, each with its own continuous-target BCE. No
+// softmax constraint between channels — each head is a standalone
+// binary classifier. Used by the 3-head beat-RNN (downbeat /
+// any-beat / any-onset) where each output corresponds to a separate
+// visual axis downstream.
+//
+// Why per-channel sigmoid + BCE rather than softmax:
+//   - Earlier 3-class softmax attempt was killed by class imbalance
+//     (~91% non-beat majority). Per-channel sigmoid avoids the
+//     mutually-exclusive constraint so each head only competes
+//     against its own non-class, not all other classes simultaneously.
+//   - Hierarchical labels (col 1 includes col 0 hits, col 2 includes
+//     col 1 hits) are natural under independent sigmoids and would
+//     be illegal under softmax.
+//
+// Numerically-stable BCE-with-logits per channel:
+//   loss_c = max(z_c, 0) - z_c * t_c + log(1 + exp(-|z_c|))
+// Gradient: d_loss/d_z_c = sigmoid(z_c) - t_c
+//
+// Per-batch loss accumulator stores the SUM over channels (matches
+// what bce_loss.comp stores for the single-channel case, which is
+// trivially the "sum over channels" with N=1). Caller is responsible
+// for any downstream per-channel-loss breakout — that's a download-
+// time slice rather than a separate accumulator.
+// ============================================================
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer LogitsBuf  { float logits[]; };
+layout(std430, binding = 1) readonly buffer TargetsBuf { float targets[]; };
+layout(std430, binding = 2)          buffer GradAccBuf { float grad_acc[]; };
+layout(std430, binding = 3)          buffer LossAccBuf { float loss_acc[]; };
+
+layout(push_constant) uniform PushConstants {
+    int batch_size;
+    int n_classes;
+    int target_offset; // float-element offset into targets — lets the caller
+                       // share one (B, T, C) targets buffer across all T per-
+                       // timestep dispatches.
+    float t_inv;       // 1.0 / T — averages loss + grad over the sequence.
+};
+
+void main() {
+    int b = int(gl_GlobalInvocationID.x);
+    if (b >= batch_size) return;
+
+    float inv_b = 1.0 / float(batch_size);
+    float loss_sum = 0.0;
+
+    for (int c = 0; c < n_classes; ++c) {
+        int idx = b * n_classes + c;
+        float z = logits[idx];
+        float t = targets[target_offset + idx];
+
+        // Numerically-stable BCE-with-logits
+        float abs_z = abs(z);
+        float max_z = max(z, 0.0);
+        float loss_c = max_z - z * t + log(1.0 + exp(-abs_z));
+        loss_sum += loss_c;
+
+        // sigmoid(z) − t  →  per-channel gradient on z
+        float sigmoid_z = 1.0 / (1.0 + exp(-z));
+        float grad = sigmoid_z - t;
+
+        grad_acc[idx] += grad * inv_b * t_inv;
+    }
+
+    // One loss-per-batch-element entry (sum over channels). Caller can
+    // mean-over-batch on download; per-channel breakout would require
+    // a (B, C) accumulator — defer until we actually want per-channel
+    // F1 during training rather than at validation only.
+    loss_acc[b] += loss_sum * t_inv;
+}
