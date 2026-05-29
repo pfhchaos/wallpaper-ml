@@ -28,7 +28,10 @@ from .losses import (
     bce_loss_multich_dispatch,
     cross_entropy_dispatch,
 )
-from .models import VkModel, build_cnn_scorer, build_beat_crnn
+from .models import (
+    VkModel, MultiDepthBeatRNN,
+    build_cnn_scorer, build_beat_crnn, build_beat_crnn_multidepth,
+)
 from .packed_corpus import (
     ChannelSpec,
     CorpusSchema,
@@ -51,11 +54,13 @@ __all__ = [
     'VkLinear',
     'VkGRU',
     'VkModel',
+    'MultiDepthBeatRNN',
     'bce_loss_dispatch',
     'bce_loss_multich_dispatch',
     'cross_entropy_dispatch',
     'build_cnn_scorer',
     'build_beat_crnn',
+    'build_beat_crnn_multidepth',
     # packed_corpus
     'ChannelSpec',
     'CorpusSchema',
