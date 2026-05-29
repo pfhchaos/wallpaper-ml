@@ -29,6 +29,17 @@ from .losses import (
     cross_entropy_dispatch,
 )
 from .models import VkModel, build_cnn_scorer, build_beat_crnn
+from .packed_corpus import (
+    ChannelSpec,
+    CorpusSchema,
+    SCHEMA_FILENAME,
+    load_packed,
+    load_schema,
+    pack_corpus,
+    pack_one,
+    packed_frames,
+    write_schema,
+)
 
 __all__ = [
     'VkCompute',
@@ -45,4 +56,14 @@ __all__ = [
     'cross_entropy_dispatch',
     'build_cnn_scorer',
     'build_beat_crnn',
+    # packed_corpus
+    'ChannelSpec',
+    'CorpusSchema',
+    'SCHEMA_FILENAME',
+    'load_packed',
+    'load_schema',
+    'pack_corpus',
+    'pack_one',
+    'packed_frames',
+    'write_schema',
 ]
