@@ -11,15 +11,22 @@
 // against the soft target, accumulate per-batch.
 //
 // Numerically-stable BCE-with-logits formulation:
-//   loss = max(z, 0) - z * t + log(1 + exp(-|z|))
-// where z = logit. Avoids overflow when |z| is large.
+//   unweighted: loss = max(z, 0) - z * t + log(1 + exp(-|z|))
+// With pos_weight w applied to positive examples (matches PyTorch's
+// BCEWithLogitsLoss(pos_weight=w)):
+//   loss = w*t*softplus(-z) + (1-t)*softplus(z)
+//   where softplus(x) = max(x,0) + log(1 + exp(-|x|))
+// Reduces to the unweighted form when w == 1.
 //
-// Gradient w.r.t. logit (the clean part of BCE-with-sigmoid):
-//   d_loss/d_z = sigmoid(z) - target
+// Gradient w.r.t. logit:
+//   unweighted: d_loss/d_z = sigmoid(z) - target
+//   weighted:   d_loss/d_z = sigmoid(z) * (1 + (w-1)*t) - w*t
+// Same identity-at-w=1 reduction.
 //
-// Just like softmax CE gives (prob - target) for the input gradient,
-// sigmoid BCE gives (sigmoid - target). Same structure, different
-// channel count.
+// Used to combat per-head class imbalance in multidepth beat-RNN —
+// downbeat is ~1.5% positive vs ~12% for onset, so pos_weight ≈ 64
+// fully equalizes the positive/negative contribution to the loss
+// for that head (or sqrt(64) ≈ 8 for milder rebalancing).
 // ============================================================
 
 layout(local_size_x = 32) in;
@@ -35,6 +42,9 @@ layout(push_constant) uniform PushConstants {
                        // share one (B, T) targets buffer across all T per-
                        // timestep dispatches.
     float t_inv;       // 1.0 / T — averages loss + grad over the sequence.
+    float pos_weight;  // multiplier on positive (target=1) contribution.
+                       // 1.0 = standard BCE; >1.0 up-weights positives
+                       // to counter low-positive-rate imbalance.
 };
 
 void main() {
@@ -43,15 +53,19 @@ void main() {
 
     float z = logits[b];                       // single logit per batch element
     float t = targets[target_offset + b];      // soft target in [0, 1]
+    float w = pos_weight;
 
-    // Numerically-stable BCE-with-logits
+    // Numerically-stable BCE-with-logits, with optional pos_weight.
+    // softplus(x) = max(x,0) + log(1 + exp(-|x|))
     float abs_z = abs(z);
-    float max_z = max(z, 0.0);
-    float loss = max_z - z * t + log(1.0 + exp(-abs_z));
+    float log_term = log(1.0 + exp(-abs_z));
+    float softplus_neg_z = max(-z, 0.0) + log_term;  // -log(sigmoid(z))
+    float softplus_pos_z = max( z, 0.0) + log_term;  // -log(1-sigmoid(z))
+    float loss = w * t * softplus_neg_z + (1.0 - t) * softplus_pos_z;
 
-    // sigmoid(z) — gradient w.r.t. z is (sigmoid(z) - t)
+    // Gradient: sigmoid(z) * (1 + (w-1)*t) - w*t
     float sigmoid_z = 1.0 / (1.0 + exp(-z));
-    float grad = sigmoid_z - t;
+    float grad = sigmoid_z * (1.0 + (w - 1.0) * t) - w * t;
 
     // Per-element accumulation. Loss is averaged over batch on download
     // by the caller; gradient is scaled by 1/B so the running grad after

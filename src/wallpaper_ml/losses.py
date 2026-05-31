@@ -19,7 +19,8 @@ RNN_SHADER_DIR = Path(__file__).parent / 'shaders' / 'rnn'
 def bce_loss_dispatch(gpu: VkCompute, logits_buf: VkBuffer,
                       target_buf: VkBuffer, grad_acc_buf: VkBuffer,
                       loss_acc_buf: VkBuffer, batch_size: int,
-                      target_offset_floats: int, t_inv: float) -> None:
+                      target_offset_floats: int, t_inv: float,
+                      pos_weight: float = 1.0) -> None:
     """Dispatch the bce_loss shader for one timestep.
 
     Single-channel regression: each batch element has one logit and one
@@ -27,6 +28,14 @@ def bce_loss_dispatch(gpu: VkCompute, logits_buf: VkBuffer,
     gradient (size B) into the pre-allocated accumulators, weighted by
     t_inv so after T dispatches the accumulators hold mean-over-
     timesteps values. Caller zeroes both at the start of the batch.
+
+    pos_weight: PyTorch-style multiplier on positive (target=1)
+    examples. 1.0 (default) = standard BCE. Use n_neg/n_pos to fully
+    equalize positive/negative loss contribution within this head;
+    sqrt(n_neg/n_pos) for a gentler rebalancing that doesn't risk
+    flipping the bias the other way. Set per-head when the multidepth
+    trainer's heads have different positive rates (downbeat is ~1.5%
+    vs onset ~12% in the beat corpus).
 
     Used by the continuous-activation reformulation of the beat-RNN
     (single output channel = beat probability) — sidesteps the
@@ -36,9 +45,10 @@ def bce_loss_dispatch(gpu: VkCompute, logits_buf: VkBuffer,
     pipeline = gpu.create_pipeline(
         str(RNN_SHADER_DIR / 'bce_loss.comp'),
         buffers=[logits_buf, target_buf, grad_acc_buf, loss_acc_buf],
-        push_constant_size=12,
+        push_constant_size=16,
     )
-    push = struct.pack('2if', batch_size, target_offset_floats, t_inv)
+    push = struct.pack('2iff', batch_size, target_offset_floats, t_inv,
+                       float(pos_weight))
     n_workgroups = (batch_size + 31) // 32
     gpu.dispatch(pipeline, n_workgroups, push_constants=push)
 
