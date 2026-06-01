@@ -22,8 +22,26 @@
 // flows back through the chain.
 //
 // Math is bit-identical to gru_backward.comp's single-step body,
-// just wrapped in a t-loop with offsets. Same weight gradient
-// accumulation via CAS atomics on uint-aliased float buffers.
+// just wrapped in a t-loop with offsets. Weight gradient
+// accumulation is the workgroup-shared pattern (see below).
+//
+// ----- Workgroup-shared weight grad accumulation (Path B) -----
+//
+// Earlier this shader CAS-spin-added every thread's per-timestep
+// gradient contribution directly into the global grad_W / grad_U /
+// grad_bias buffers. With B × T threads all CAS'ing into the same
+// parameter addresses at the same time, contention was 100% by
+// construction and the GPU's GuC scheduler was wedged twice on
+// 2026-05-31 trying to make forward progress.
+//
+// The new pattern: each thread accumulates its own column slice in
+// private-memory arrays across all T timesteps (just `+=`, no
+// atomics needed — each thread owns its slice). After the T-loop
+// closes, each thread emits one CAS write per parameter slot to
+// flush its accumulated total to global. Atomic op count drops by
+// a factor of T (256× for the deployed model), and the remaining
+// CASes face workgroup-count contention instead of B×T-thread
+// contention.
 // ============================================================
 
 layout(local_size_x = 64) in;
@@ -56,6 +74,21 @@ shared float s_dh_prev_direct[64];
 // Running recurrent dh — persists across iterations of the BPTT loop
 shared float s_running_dh[64];
 
+// Per-thread private grad accumulators. Each thread j owns its column
+// slice of W (3 gates × max-input-size), U (3 gates × max-hidden-size),
+// and bias (6 slots). Sized for the largest production model dims
+// (input_size ≤ 64, hidden_size ≤ 64); training-time runtime values
+// are used for the loop trip counts so smaller models leave the tail
+// of the arrays unused (and unread).
+//
+// Memory: 3*64 + 3*64 + 6 = 390 floats per thread = 1.5KB. Mesa-Xe
+// will fit most of this in registers and spill the rest to private
+// memory; spilled private memory uses sequential indexed access
+// (cheap) vs CAS-spin (pathological), so the trade is heavily
+// favorable.
+const int MAX_INPUT_SIZE  = 64;
+const int MAX_HIDDEN_SIZE = 64;
+
 void main() {
     int j = int(gl_LocalInvocationID.x);
     int b = int(gl_WorkGroupID.x);
@@ -68,6 +101,26 @@ void main() {
     int B = batch_size;
     int w_gate_stride = I * H;
     int u_gate_stride = H * H;
+
+    // Private grad accumulators — initialize to zero. Only the used
+    // portion (up to I or H, respectively) matters; the rest stays
+    // zero and is never read.
+    float grad_W_local[3 * MAX_INPUT_SIZE];
+    float grad_U_local[3 * MAX_HIDDEN_SIZE];
+    float grad_bias_local[6];
+    for (int i = 0; i < I; i++) {
+        grad_W_local[0 * MAX_INPUT_SIZE + i] = 0.0;
+        grad_W_local[1 * MAX_INPUT_SIZE + i] = 0.0;
+        grad_W_local[2 * MAX_INPUT_SIZE + i] = 0.0;
+    }
+    for (int k = 0; k < H; k++) {
+        grad_U_local[0 * MAX_HIDDEN_SIZE + k] = 0.0;
+        grad_U_local[1 * MAX_HIDDEN_SIZE + k] = 0.0;
+        grad_U_local[2 * MAX_HIDDEN_SIZE + k] = 0.0;
+    }
+    for (int g = 0; g < 6; g++) {
+        grad_bias_local[g] = 0.0;
+    }
 
     // BPTT starts with running_dh = 0 (no recurrent grad flowing from "beyond" T)
     if (is_active) s_running_dh[j] = 0.0;
@@ -119,97 +172,30 @@ void main() {
             s_d_ruh[j] = d_ruh_val;
             s_dh_prev_direct[j] = dh_prev_direct;
 
-            // --- Accumulate W gradients (atomic CAS) ---
+            // --- Accumulate W gradients into private memory (no atomics) ---
             for (int i = 0; i < I; i++) {
                 float xi = x_seq[t_offset_x + i];
-                if (dz_pre_val != 0.0) {
-                    uint tgt = uint(0 * w_gate_stride + i * H + j);
-                    uint exp_val = grad_W[tgt];
-                    while (true) {
-                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dz_pre_val * xi);
-                        uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
-                        if (old == exp_val) break;
-                        exp_val = old;
-                    }
-                }
-                if (dr_pre_val != 0.0) {
-                    uint tgt = uint(1 * w_gate_stride + i * H + j);
-                    uint exp_val = grad_W[tgt];
-                    while (true) {
-                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dr_pre_val * xi);
-                        uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
-                        if (old == exp_val) break;
-                        exp_val = old;
-                    }
-                }
-                if (dn_pre_val != 0.0) {
-                    uint tgt = uint(2 * w_gate_stride + i * H + j);
-                    uint exp_val = grad_W[tgt];
-                    while (true) {
-                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dn_pre_val * xi);
-                        uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
-                        if (old == exp_val) break;
-                        exp_val = old;
-                    }
-                }
+                grad_W_local[0 * MAX_INPUT_SIZE + i] += dz_pre_val * xi;
+                grad_W_local[1 * MAX_INPUT_SIZE + i] += dr_pre_val * xi;
+                grad_W_local[2 * MAX_INPUT_SIZE + i] += dn_pre_val * xi;
             }
 
-            // --- Accumulate U gradients ---
+            // --- Accumulate U gradients into private memory ---
             for (int k = 0; k < H; k++) {
                 float hk = cache[c_base + 3 * H + k];
-                if (dz_pre_val != 0.0) {
-                    uint tgt = uint(0 * u_gate_stride + k * H + j);
-                    uint exp_val = grad_U[tgt];
-                    while (true) {
-                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dz_pre_val * hk);
-                        uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
-                        if (old == exp_val) break;
-                        exp_val = old;
-                    }
-                }
-                if (dr_pre_val != 0.0) {
-                    uint tgt = uint(1 * u_gate_stride + k * H + j);
-                    uint exp_val = grad_U[tgt];
-                    while (true) {
-                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + dr_pre_val * hk);
-                        uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
-                        if (old == exp_val) break;
-                        exp_val = old;
-                    }
-                }
-                if (d_ruh_val != 0.0) {
-                    uint tgt = uint(2 * u_gate_stride + k * H + j);
-                    uint exp_val = grad_U[tgt];
-                    while (true) {
-                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + d_ruh_val * hk);
-                        uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
-                        if (old == exp_val) break;
-                        exp_val = old;
-                    }
-                }
+                grad_U_local[0 * MAX_HIDDEN_SIZE + k] += dz_pre_val * hk;
+                grad_U_local[1 * MAX_HIDDEN_SIZE + k] += dr_pre_val * hk;
+                grad_U_local[2 * MAX_HIDDEN_SIZE + k] += d_ruh_val  * hk;
             }
 
-            // --- Accumulate bias gradients ---
+            // --- Accumulate bias gradients into private memory ---
             // Layout: [bW_z, bW_r, bW_n, bU_z, bU_r, bU_n]
-            uint bj = uint(j);
-            { uint tgt = 0u * uint(H) + bj; uint e = grad_bias[tgt];
-              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dz_pre_val);
-              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
-            { uint tgt = 1u * uint(H) + bj; uint e = grad_bias[tgt];
-              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dr_pre_val);
-              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
-            { uint tgt = 2u * uint(H) + bj; uint e = grad_bias[tgt];
-              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dn_pre_val);
-              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
-            { uint tgt = 3u * uint(H) + bj; uint e = grad_bias[tgt];
-              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dz_pre_val);
-              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
-            { uint tgt = 4u * uint(H) + bj; uint e = grad_bias[tgt];
-              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+dr_pre_val);
-              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
-            { uint tgt = 5u * uint(H) + bj; uint e = grad_bias[tgt];
-              while(true) { uint d = floatBitsToUint(uintBitsToFloat(e)+d_ruh_val);
-              uint o = atomicCompSwap(grad_bias[tgt],e,d); if(o==e) break; e=o; }}
+            grad_bias_local[0] += dz_pre_val;
+            grad_bias_local[1] += dr_pre_val;
+            grad_bias_local[2] += dn_pre_val;
+            grad_bias_local[3] += dz_pre_val;
+            grad_bias_local[4] += dr_pre_val;
+            grad_bias_local[5] += d_ruh_val;
         } else {
             // Inactive thread: zero shared so Phase 2/3 sums don't read garbage
             s_dz_pre[j] = 0.0;
@@ -247,5 +233,72 @@ void main() {
 
         barrier();
         memoryBarrierShared();
+    }
+
+    // -------------------------------------------------------------------
+    // After T-loop: flush private grad accumulators to global with one
+    // CAS write per parameter slot per workgroup. Total atomic count
+    // per backward dispatch:
+    //     B workgroups × H threads × (3I + 3H + 6) atomics
+    // vs. the previous shader's:
+    //     B × T × H × (3I + 3H + 6) atomics
+    // (the per-CAS contention drops by the same T factor since fewer
+    // threads race for each address simultaneously).
+    //
+    // The skip-zero short-circuit is a perf-not-correctness optimization
+    // — if the accumulated delta is exactly zero we don't bother with
+    // the CAS, since adding zero is identity. Matches the original
+    // shader's per-iteration zero-skip.
+    // -------------------------------------------------------------------
+    if (is_active) {
+        // W: 3 gates × I per thread
+        for (int g = 0; g < 3; g++) {
+            for (int i = 0; i < I; i++) {
+                float delta = grad_W_local[g * MAX_INPUT_SIZE + i];
+                if (delta != 0.0) {
+                    uint tgt = uint(g * w_gate_stride + i * H + j);
+                    uint exp_val = grad_W[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + delta);
+                        uint old = atomicCompSwap(grad_W[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+            }
+        }
+
+        // U: 3 gates × H per thread
+        for (int g = 0; g < 3; g++) {
+            for (int k = 0; k < H; k++) {
+                float delta = grad_U_local[g * MAX_HIDDEN_SIZE + k];
+                if (delta != 0.0) {
+                    uint tgt = uint(g * u_gate_stride + k * H + j);
+                    uint exp_val = grad_U[tgt];
+                    while (true) {
+                        uint des = floatBitsToUint(uintBitsToFloat(exp_val) + delta);
+                        uint old = atomicCompSwap(grad_U[tgt], exp_val, des);
+                        if (old == exp_val) break;
+                        exp_val = old;
+                    }
+                }
+            }
+        }
+
+        // Bias: 6 slots per thread
+        uint bj = uint(j);
+        for (int g = 0; g < 6; g++) {
+            float delta = grad_bias_local[g];
+            if (delta != 0.0) {
+                uint tgt = uint(g) * uint(H) + bj;
+                uint exp_val = grad_bias[tgt];
+                while (true) {
+                    uint des = floatBitsToUint(uintBitsToFloat(exp_val) + delta);
+                    uint old = atomicCompSwap(grad_bias[tgt], exp_val, des);
+                    if (old == exp_val) break;
+                    exp_val = old;
+                }
+            }
+        }
     }
 }
