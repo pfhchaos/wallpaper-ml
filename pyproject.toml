@@ -9,6 +9,7 @@ description = "Vulkan compute ML framework — PyTorch-style layers, losses, mod
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0",
+    "vulkan",
 ]
 
 [project.optional-dependencies]
