@@ -20,3 +20,16 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 wallpaper_ml = ["shaders/cnn/*.comp", "shaders/rnn/*.comp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Mirrors the root monorepo pyproject.toml's pytest config (see its
+# [tool.pytest.ini_options] comment) so this package's test suite is
+# self-sufficient when run standalone — from its own rootdir, outside the
+# monorepo — ahead of the 0.9 repo split. --import-mode=importlib avoids
+# the cwd-shadow footgun where a stray same-named directory on sys.path
+# masks the installed package.
+addopts = "--tb=short -m 'not slow' --import-mode=importlib --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
