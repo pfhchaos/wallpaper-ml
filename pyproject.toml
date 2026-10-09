@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "wallpaper-ml"
 version = "0.1.0"
 description = "Vulkan compute ML framework — PyTorch-style layers, losses, models for audio-reactive wallpapers"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0",
